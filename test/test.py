@@ -1,40 +1,66 @@
-# SPDX-FileCopyrightText: © 2024 Tiny Tapeout
+# SPDX-FileCopyrightText: © 2024 Your Name
 # SPDX-License-Identifier: Apache-2.0
 
 import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles
 
-
 @cocotb.test()
-async def test_project(dut):
-    dut._log.info("Start")
+async def test_vga_lorenz(dut):
+    dut._log.info("Starting VGA Lorenz Attractor Test")
 
-    # Set the clock period to 10 us (100 KHz)
-    clock = Clock(dut.clk, 10, unit="us")
+    # 1. Set the clock period to 40 ns (25 MHz) for standard 640x480 VGA
+    clock = Clock(dut.clk, 40, unit="ns")
     cocotb.start_soon(clock.start())
 
-    # Reset
-    dut._log.info("Reset")
+    # 2. Initialize inputs
     dut.ena.value = 1
     dut.ui_in.value = 0
     dut.uio_in.value = 0
     dut.rst_n.value = 0
+
+    # 3. Apply Reset
+    dut._log.info("Resetting DUT")
     await ClockCycles(dut.clk, 10)
     dut.rst_n.value = 1
+    dut._log.info("Reset complete")
 
-    dut._log.info("Test project behavior")
-
-    # Set the input values you want to test
-    dut.ui_in.value = 20
-    dut.uio_in.value = 30
-
-    # Wait for one clock cycle to see the output values
+    # Wait one cycle for values to propagate
     await ClockCycles(dut.clk, 1)
 
-    # The following assersion is just an example of how to check the output values.
-    # Change it to match the actual expected output of your module:
-    assert dut.uo_out.value == 50
+    # 4. Check static assignments
+    assert dut.uio_out.value == 0, "uio_out should be tied to 0"
+    assert dut.uio_oe.value == 0, "uio_oe should be tied to 0"
 
-    # Keep testing the module by changing the input values, waiting for
-    # one or more clock cycles, and asserting the expected output values.
+    # Helper function to read the HSYNC bit (uo_out[7])
+    def get_hsync():
+        return (dut.uo_out.value.integer >> 7) & 1
+
+    # Helper function to read the VSYNC bit (uo_out[3])
+    def get_vsync():
+        return (dut.uo_out.value.integer >> 3) & 1
+
+    # 5. Test VGA Timing
+    dut._log.info("Testing HSYNC timing...")
+
+    # At the start of the line (hpos = 0), HSYNC should be HIGH (active low sync)
+    assert get_hsync() == 1, "HSYNC should be high during active video"
+
+    # According to your Verilog: hsync is LOW when hpos >= 656 && hpos < 752
+    # Let's advance time to cycle 660 (safely inside the sync pulse)
+    await ClockCycles(dut.clk, 660)
+    
+    assert get_hsync() == 0, "HSYNC should be LOW during the sync pulse (hpos >= 656)"
+
+    # Advance time to cycle 760 (safely out of the sync pulse, hpos > 752)
+    await ClockCycles(dut.clk, 100)
+    
+    assert get_hsync() == 1, "HSYNC should be HIGH again after the sync pulse"
+
+    dut._log.info("HSYNC timing verified successfully!")
+
+    # 6. Run the chaos engine for a bit to ensure it doesn't crash the simulation
+    dut._log.info("Running chaos engine logic for a few lines...")
+    await ClockCycles(dut.clk, 3000)
+
+    dut._log.info("Simulation passed!")
