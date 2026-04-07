@@ -6,7 +6,7 @@ SIM ?= icarus
 FST ?= -fst # Use more efficient FST format
 TOPLEVEL_LANG ?= verilog
 SRC_DIR = $(PWD)/../src
-PROJECT_SOURCES = lorenz_motion_1x1.v
+PROJECT_SOURCES = lorenz_motion.v
 
 ifneq ($(GATES),yes)
 
