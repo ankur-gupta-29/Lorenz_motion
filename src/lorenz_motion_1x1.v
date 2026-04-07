@@ -16,7 +16,7 @@ module tt_um_lorenz_motion(
 );
 
     // =========================================================================
-    // 1. VGA TIMING GENERATOR (640x480 @ 60Hz - 25MHz Clock Expected)
+    // 1. VGA TIMING GENERATOR 
     // =========================================================================
     reg [9:0] hpos;
     reg [9:0] vpos;
@@ -42,17 +42,14 @@ module tt_um_lorenz_motion(
     assign display_on = (hpos < 640 && vpos < 480);
 
     // =========================================================================
-    // 2. DIGITAL NOISE GENERATOR (16-bit LFSR)
+    // 2. DIGITAL NOISE GENERATOR
     // =========================================================================
     reg [15:0] lfsr;
     wire feedback = lfsr[15] ^ lfsr[13] ^ lfsr[12] ^ lfsr[10];
 
     always @(posedge clk) begin
-        if (~rst_n) begin
-            lfsr <= 16'hACE1; 
-        end else begin
-            lfsr <= {lfsr[14:0], feedback};
-        end
+        if (~rst_n) lfsr <= 16'hACE1; 
+        else        lfsr <= {lfsr[14:0], feedback};
     end
 
     wire signed [31:0] noise_x = {31'b0, lfsr[0]};
@@ -60,34 +57,10 @@ module tt_um_lorenz_motion(
     wire signed [31:0] noise_z = {31'b0, lfsr[2]};
 
     // =========================================================================
-    // 3. CHAOS ENGINE: 1x1 TILE AREA OPTIMIZED MATH
+    // 3. CHAOS ENGINE: FIXED 1x1 STATE MACHINE 
     // =========================================================================
     reg signed [31:0] x, y, z;
-
-    // Extracted down to 12-bit slices to drastically reduce multiplier area
-    wire signed [31:0] x_ext = {{20{x[31]}}, x[27:16]};
-    wire signed [31:0] y_ext = {{20{y[31]}}, y[27:16]};
-    wire signed [31:0] z_ext = {{20{z[31]}}, z[27:16]};
-
-    // Constants scaled for the 12-bit Q12.16 slice format
-    wire signed [31:0] RHO_32  = 32'sd448; // 28.0 * 16
-    wire signed [31:0] BETA_32 = 32'sd42;  // 8/3  * 16
-
-    // Smaller 12x12 = 24-bit physical multipliers
-    wire signed [31:0] p_xy_32    = x_ext * y_ext;
-    wire signed [31:0] p_x_rho_32 = x_ext * (RHO_32 - z_ext);
-    wire signed [31:0] p_z_b_32   = z_ext * BETA_32;
-
-    // Shift back up to standard Q12.20
-    wire signed [31:0] p_xy_20    = p_xy_32 <<< 12;
-    wire signed [31:0] p_x_rho_20 = p_x_rho_32 <<< 12;
-    wire signed [31:0] p_z_b_20   = p_z_b_32 <<< 12;
-
-    wire signed [31:0] y_minus_x = y - x;
-    wire signed [31:0] dx = (y_minus_x <<< 3) + (y_minus_x <<< 1); 
-    wire signed [31:0] dy = p_x_rho_20 - y;
-    wire signed [31:0] dz = p_xy_20 - p_z_b_20;
-
+    
     reg [14:0] tick;
     always @(posedge clk) begin
         if (~rst_n) tick <= 0;
@@ -95,15 +68,49 @@ module tt_um_lorenz_motion(
     end
     wire update_pulse = (tick == 0);
 
+    // Slices for multiplication (Q8.4 Format = 12 bits)
+    wire signed [11:0] x_slice = {x[31], x[26:16]};
+    wire signed [11:0] y_slice = {y[31], y[26:16]};
+    wire signed [11:0] z_slice = {z[31], z[26:16]};
+
+    wire signed [11:0] RHO_12  = 12'sd448; // 28.0 * 16
+    wire signed [11:0] BETA_12 = 12'sd42;  // 8/3  * 16
+
+    // STATE MACHINE SETUP (Now 4 States to ensure math is stable)
+    reg [1:0] state;
+    localparam S_IDLE = 2'd0, S_MULT1 = 2'd1, S_MULT2 = 2'd2, S_MULT3 = 2'd3;
+
+    // THE SINGLE SHARED MULTIPLIER 
+    wire signed [11:0] mult_a = (state == S_MULT1) ? x_slice : 
+                                (state == S_MULT2) ? x_slice : z_slice;
+                                
+    wire signed [11:0] mult_b = (state == S_MULT1) ? y_slice : 
+                                (state == S_MULT2) ? (RHO_12 - z_slice) : BETA_12;
+
+    wire signed [23:0] mult_out = mult_a * mult_b;
+
+    // Registers to hold the intermediate math
+    reg signed [23:0] p_xy_res;
+    reg signed [23:0] p_x_rho_res;
+
+    // Map the 24-bit results back to 32-bit Q12.20
+    wire signed [31:0] p_xy_20    = {{8{p_xy_res[23]}}, p_xy_res} <<< 12;
+    wire signed [31:0] p_x_rho_20 = {{8{p_x_rho_res[23]}}, p_x_rho_res} <<< 12;
+    wire signed [31:0] p_z_b_20   = {{8{mult_out[23]}}, mult_out} <<< 12; 
+
+    wire signed [31:0] y_minus_x = y - x;
+    wire signed [31:0] dx = (y_minus_x <<< 3) + (y_minus_x <<< 1); 
+    wire signed [31:0] dy = p_x_rho_20 - y;
+    wire signed [31:0] dz = p_xy_20 - p_z_b_20;
+
     // Screen projection
     wire signed [31:0] sx_signed = 32'sd320 + (x >>> 17); 
     wire signed [31:0] sy_signed = 32'sd440 - (z >>> 17); 
-    
     wire [9:0] sx = (sx_signed < 0) ? 10'd0 : ((sx_signed > 639) ? 10'd639 : sx_signed[9:0]);
     wire [9:0] sy = (sy_signed < 0) ? 10'd0 : ((sy_signed > 479) ? 10'd479 : sy_signed[9:0]);
 
     // =========================================================================
-    // 4. HISTORY BUFFER (Reduced to 4 Length to fit in 1 Tile)
+    // 4. HISTORY BUFFER & FSM EXECUTION
     // =========================================================================
     localparam TRAIL_LEN = 4;
     reg [9:0] hist_x [0:TRAIL_LEN-1];
@@ -112,29 +119,47 @@ module tt_um_lorenz_motion(
 
     always @(posedge clk) begin
         if (~rst_n) begin
-            x <= 32'sd1048576; // 1.0 in Q12.20
+            x <= 32'sd1048576; // 1.0 
             y <= 32'sd0; 
             z <= 32'sd0; 
+            state <= S_IDLE;
             for (i = 0; i < TRAIL_LEN; i = i + 1) begin
                 hist_x[i] <= 10'd800; 
                 hist_y[i] <= 10'd800;
             end
-        end else if (update_pulse) begin
-            x <= x + (dx >>> 8) + noise_x; 
-            y <= y + (dy >>> 8) + noise_y;
-            z <= z + (dz >>> 8) + noise_z;
-            
-            for (i = TRAIL_LEN-1; i > 0; i = i - 1) begin
-                hist_x[i] <= hist_x[i-1];
-                hist_y[i] <= hist_y[i-1];
+        end else begin
+            // STATE MACHINE LOGIC
+            if (state == S_IDLE) begin
+                if (update_pulse) state <= S_MULT1;
+            end 
+            else if (state == S_MULT1) begin
+                p_xy_res <= mult_out; // Save X*Y
+                state <= S_MULT2;
+            end 
+            else if (state == S_MULT2) begin
+                p_x_rho_res <= mult_out; // Save X*(RHO-Z)
+                state <= S_MULT3;        // Advance to next multiplier stage
+            end 
+            else if (state == S_MULT3) begin
+                // Now mult_out stably holds Z*BETA! We can safely update.
+                x <= x + (dx >>> 8) + noise_x; 
+                y <= y + (dy >>> 8) + noise_y;
+                z <= z + (dz >>> 8) + noise_z;
+                
+                for (i = TRAIL_LEN-1; i > 0; i = i - 1) begin
+                    hist_x[i] <= hist_x[i-1];
+                    hist_y[i] <= hist_y[i-1];
+                end
+                hist_x[0] <= sx;
+                hist_y[0] <= sy;
+
+                state <= S_IDLE; // Done calculating, wait for next tick
             end
-            hist_x[0] <= sx;
-            hist_y[0] <= sy;
         end
     end
 
     // =========================================================================
-    // 5. DRAWING THE TAIL (Optimized for Logic Area)
+    // 5. DRAWING THE TAIL 
     // =========================================================================
     reg in_trail;
     reg [1:0] trail_age;
@@ -149,7 +174,6 @@ module tt_um_lorenz_motion(
             diff_x = (hpos > hist_x[j]) ? (hpos - hist_x[j]) : (hist_x[j] - hpos);
             diff_y = (vpos > hist_y[j]) ? (vpos - hist_y[j]) : (hist_y[j] - vpos);
             
-            // AREA HACK: Use Bitwise OR instead of Addition
             if ((diff_x | diff_y) < 10'd4) begin
                 in_trail = 1;
                 trail_age = j[1:0];
